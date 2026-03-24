@@ -37,6 +37,10 @@ from problem import (
 )
 
 
+def slot_is_mem_read(slot):
+    return slot[0] in ("load", "vload", "load_offset")
+
+
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
@@ -84,23 +88,191 @@ class KernelBuilder:
             self.vconst_map[val] = vec
         return self.vconst_map[val]
 
-    def build_vhash(self, vval, vtmp1, vtmp2):
-        """Vectorized 6-stage hash on VLEN elements in parallel."""
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+    def _op_deps(self, engine, slot):
+        """Return (reads, writes) as sets of scratch addresses for dependency tracking."""
+        reads, writes = set(), set()
+        if engine == "debug":
+            return reads, writes
+        if engine == "alu":
+            _, dest, a1, a2 = slot
+            reads.update([a1, a2])
+            writes.add(dest)
+        elif engine == "valu":
+            if slot[0] == "vbroadcast":
+                _, dest, src = slot
+                reads.add(src)
+                writes.update(range(dest, dest + VLEN))
+            elif slot[0] == "multiply_add":
+                _, dest, a, b, c = slot
+                for r in (a, b, c):
+                    reads.update(range(r, r + VLEN))
+                writes.update(range(dest, dest + VLEN))
+            else:
+                _, dest, a1, a2 = slot
+                reads.update(range(a1, a1 + VLEN))
+                reads.update(range(a2, a2 + VLEN))
+                writes.update(range(dest, dest + VLEN))
+        elif engine == "load":
+            if slot[0] == "const":
+                writes.add(slot[1])
+            elif slot[0] == "load":
+                _, dest, addr = slot
+                reads.add(addr)
+                writes.add(dest)
+            elif slot[0] == "vload":
+                _, dest, addr = slot
+                reads.add(addr)
+                writes.update(range(dest, dest + VLEN))
+            elif slot[0] == "load_offset":
+                _, dest, addr, offset = slot
+                reads.add(addr + offset)
+                writes.add(dest + offset)
+        elif engine == "store":
+            if slot[0] == "store":
+                _, addr, src = slot
+                reads.update([addr, src])
+            elif slot[0] == "vstore":
+                _, addr, src = slot
+                reads.add(addr)
+                reads.update(range(src, src + VLEN))
+        elif engine == "flow":
+            if slot[0] == "select":
+                _, dest, cond, a, b = slot
+                reads.update([cond, a, b])
+                writes.add(dest)
+            elif slot[0] == "vselect":
+                _, dest, cond, a, b = slot
+                for r in (cond, a, b):
+                    reads.update(range(r, r + VLEN))
+                writes.update(range(dest, dest + VLEN))
+            elif slot[0] == "add_imm":
+                _, dest, a, imm = slot
+                reads.add(a)
+                writes.add(dest)
+            elif slot[0] in ("cond_jump", "cond_jump_rel"):
+                reads.add(slot[1])
+        return reads, writes
+
+    def schedule(self, body):
+        """Schedule (engine, slot) pairs into packed VLIW bundles."""
+        n = len(body)
+        if n == 0:
+            return []
+
+        # Compute read/write sets
+        ops_reads = []
+        ops_writes = []
+        for engine, slot in body:
+            r, w = self._op_deps(engine, slot)
+            ops_reads.append(r)
+            ops_writes.append(w)
+
+        # Build dependency graph with RAW, WAW, and WAR
+        deps = [set() for _ in range(n)]
+        last_writer = {}  # scratch_addr -> last op index that writes it
+        readers_since_write = defaultdict(set)  # addr -> set of reader indices since last write
+        last_mem_writer = -1
+        mem_readers_since_write = set()
+
+        for i in range(n):
+            engine = body[i][0]
+            is_mem_read = engine == "load" and slot_is_mem_read(body[i][1])
+            is_mem_write = engine == "store"
+
+            # RAW: I read what was written earlier
+            for addr in ops_reads[i]:
+                if addr in last_writer:
+                    deps[i].add(last_writer[addr])
+            # WAW: I write what was written earlier (preserve order)
+            for addr in ops_writes[i]:
+                if addr in last_writer:
+                    deps[i].add(last_writer[addr])
+            # WAR: I write something that was read since last write to that addr
+            for addr in ops_writes[i]:
+                for reader in readers_since_write.get(addr, ()):
+                    deps[i].add(reader)
+
+            # Memory ordering
+            if is_mem_read and last_mem_writer >= 0:
+                deps[i].add(last_mem_writer)
+            if is_mem_write:
+                if last_mem_writer >= 0:
+                    deps[i].add(last_mem_writer)
+                for reader in mem_readers_since_write:
+                    deps[i].add(reader)
+
+            # Update trackers
+            for addr in ops_reads[i]:
+                readers_since_write[addr].add(i)
+            for addr in ops_writes[i]:
+                last_writer[addr] = i
+                readers_since_write[addr] = set()
+            if is_mem_write:
+                last_mem_writer = i
+                mem_readers_since_write = set()
+            if is_mem_read:
+                mem_readers_since_write.add(i)
+
+        # Greedy list scheduling
+        dep_count = [len(d) for d in deps]
+        reverse_deps = [[] for _ in range(n)]
+        for i in range(n):
+            for d in deps[i]:
+                reverse_deps[d].append(i)
+
+        ready = [i for i in range(n) if dep_count[i] == 0]
+        bundles = []
+
+        while ready:
+            bundle = {}
+            slot_counts = {}
+            used = []
+            remaining = []
+
+            for i in ready:
+                engine = body[i][0]
+                if engine == "debug":
+                    bundle.setdefault(engine, []).append(body[i][1])
+                    used.append(i)
+                    continue
+                count = slot_counts.get(engine, 0)
+                if count < SLOT_LIMITS.get(engine, 0):
+                    bundle.setdefault(engine, []).append(body[i][1])
+                    slot_counts[engine] = count + 1
+                    used.append(i)
+                else:
+                    remaining.append(i)
+
+            bundles.append(bundle)
+
+            # Find newly ready ops
+            new_ready = remaining
+            for i in used:
+                for j in reverse_deps[i]:
+                    dep_count[j] -= 1
+                    if dep_count[j] == 0:
+                        new_ready.append(j)
+            ready = sorted(new_ready)
+
+        return bundles
+
+    def build_vhash(self, body, vval, vtmp1, vtmp2):
+        """Append vectorized 6-stage hash ops to body list."""
+        for _, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             vc1 = self.scratch_vconst(val1)
             vc3 = self.scratch_vconst(val3)
-            self.add("valu", (op1, vtmp1, vval, vc1))
-            self.add("valu", (op3, vtmp2, vval, vc3))
-            self.add("valu", (op2, vval, vtmp1, vtmp2))
+            body.append(("valu", (op1, vtmp1, vval, vc1)))
+            body.append(("valu", (op3, vtmp2, vval, vc3)))
+            body.append(("valu", (op2, vval, vtmp1, vtmp2)))
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Vectorized kernel: processes VLEN (8) walkers per iteration using
-        vload/vstore/valu. Gather for tree node lookup uses load_offset.
+        Vectorized kernel with automatic VLIW scheduling.
         """
         tmp_addr = self.alloc_scratch("tmp_addr")
+        tmp_addr2 = self.alloc_scratch("tmp_addr2")
         tmp_init = self.alloc_scratch("tmp_init")
 
         # Load header from memory
@@ -124,6 +296,15 @@ class KernelBuilder:
         vone = self.scratch_vconst(1, "vone")
         vtwo = self.scratch_vconst(2, "vtwo")
 
+        # Pre-compute hash vector constants
+        for (_, val1, _, _, val3) in HASH_STAGES:
+            self.scratch_vconst(val1)
+            self.scratch_vconst(val3)
+
+        # Pre-compute batch offset constants
+        for i in range(0, batch_size, VLEN):
+            self.scratch_const(i)
+
         # Broadcast scalar params to vectors
         vn_nodes = self.alloc_scratch("vn_nodes", VLEN)
         self.add("valu", ("vbroadcast", vn_nodes, self.scratch["n_nodes"]))
@@ -141,48 +322,46 @@ class KernelBuilder:
         vtmp3 = self.alloc_scratch("vtmp3", VLEN)
         vaddr = self.alloc_scratch("vaddr", VLEN)
 
+        # Build body as flat op list, then schedule
+        body = []
         for round_idx in range(rounds):
             for i in range(0, batch_size, VLEN):
                 i_const = self.scratch_const(i)
 
-                # --- Load 8 indices via vload (contiguous) ---
-                self.add("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
-                self.add("load", ("vload", vidx, tmp_addr))
+                # Load 8 indices (contiguous)
+                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+                body.append(("load", ("vload", vidx, tmp_addr)))
 
-                # --- Load 8 values via vload (contiguous) ---
-                self.add("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const))
-                self.add("load", ("vload", vval, tmp_addr))
+                # Load 8 values (contiguous) — use tmp_addr2 so addr calcs are independent
+                body.append(("alu", ("+", tmp_addr2, self.scratch["inp_values_p"], i_const)))
+                body.append(("load", ("vload", vval, tmp_addr2)))
 
-                # --- Gather: node_val[lane] = mem[forest_values_p + idx[lane]] ---
-                self.add("valu", ("+", vaddr, vforest_p, vidx))
-                for lane in range(0, VLEN, 2):
-                    self.instrs.append({
-                        "load": [
-                            ("load_offset", vnode_val, vaddr, lane),
-                            ("load_offset", vnode_val, vaddr, lane + 1),
-                        ]
-                    })
+                # Gather: node_val[lane] = mem[forest_values_p + idx[lane]]
+                body.append(("valu", ("+", vaddr, vforest_p, vidx)))
+                for lane in range(VLEN):
+                    body.append(("load", ("load_offset", vnode_val, vaddr, lane)))
 
-                # --- val = myhash(val ^ node_val) ---
-                self.add("valu", ("^", vval, vval, vnode_val))
-                self.build_vhash(vval, vtmp1, vtmp2)
+                # val = myhash(val ^ node_val)
+                body.append(("valu", ("^", vval, vval, vnode_val)))
+                self.build_vhash(body, vval, vtmp1, vtmp2)
 
-                # --- idx = 2*idx + (1 if val%2==0 else 2) ---
-                self.add("valu", ("&", vtmp1, vval, vone))  # &= instead of % -> = 
-                self.add("flow", ("vselect", vtmp3, vtmp1, vtwo, vone))
-                self.add("valu", ("*", vidx, vidx, vtwo))
-                self.add("valu", ("+", vidx, vidx, vtmp3))
+                # idx = 2*idx + (1 if val%2==0 else 2)
+                body.append(("valu", ("&", vtmp1, vval, vone)))
+                body.append(("flow", ("vselect", vtmp3, vtmp1, vtwo, vone)))
+                body.append(("valu", ("*", vidx, vidx, vtwo)))
+                body.append(("valu", ("+", vidx, vidx, vtmp3)))
 
-                # --- idx = 0 if idx >= n_nodes else idx ---
-                self.add("valu", ("<", vtmp1, vidx, vn_nodes))
-                self.add("flow", ("vselect", vidx, vtmp1, vidx, vzero))
+                # idx = 0 if idx >= n_nodes else idx
+                body.append(("valu", ("<", vtmp1, vidx, vn_nodes)))
+                body.append(("flow", ("vselect", vidx, vtmp1, vidx, vzero)))
 
-                # --- Store back 8 indices and 8 values ---
-                self.add("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
-                self.add("store", ("vstore", tmp_addr, vidx))
-                self.add("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const))
-                self.add("store", ("vstore", tmp_addr, vval))
+                # Store back — use separate addr regs so they can be parallel
+                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+                body.append(("store", ("vstore", tmp_addr, vidx)))
+                body.append(("alu", ("+", tmp_addr2, self.scratch["inp_values_p"], i_const)))
+                body.append(("store", ("vstore", tmp_addr2, vval)))
 
+        self.instrs.extend(self.schedule(body))
         self.instrs.append({"flow": [("pause",)]})
 
 
