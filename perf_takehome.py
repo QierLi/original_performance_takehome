@@ -347,13 +347,15 @@ class KernelBuilder:
 
                 # idx = 2*idx + (1 if val%2==0 else 2)
                 body.append(("valu", ("&", vtmp1, vval, vone)))
-                body.append(("flow", ("vselect", vtmp3, vtmp1, vtwo, vone)))
+                # body.append(("flow", ("vselect", vtmp3, vtmp1, vtwo, vone)))
+                body.append(("valu", ("<<", vtmp3, vone, vtmp1)))
                 body.append(("valu", ("*", vidx, vidx, vtwo)))
                 body.append(("valu", ("+", vidx, vidx, vtmp3)))
 
                 # idx = 0 if idx >= n_nodes else idx
                 body.append(("valu", ("<", vtmp1, vidx, vn_nodes)))
-                body.append(("flow", ("vselect", vidx, vtmp1, vidx, vzero)))
+                # body.append(("flow", ("vselect", vidx, vtmp1, vidx, vzero)))
+                body.append(("valu", ("*", vidx, vidx, vtmp1)))
 
                 # Store back — use separate addr regs so they can be parallel
                 body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
