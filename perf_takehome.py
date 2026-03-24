@@ -170,7 +170,9 @@ class KernelBuilder:
         # Build dependency graph with RAW, WAW, and WAR
         deps = [set() for _ in range(n)]
         last_writer = {}  # scratch_addr -> last op index that writes it
-        readers_since_write = defaultdict(set)  # addr -> set of reader indices since last write
+        readers_since_write = defaultdict(
+            set
+        )  # addr -> set of reader indices since last write
         last_mem_writer = -1
         mem_readers_since_write = set()
 
@@ -297,7 +299,7 @@ class KernelBuilder:
         vtwo = self.scratch_vconst(2, "vtwo")
 
         # Pre-compute hash vector constants
-        for (_, val1, _, _, val3) in HASH_STAGES:
+        for _, val1, _, _, val3 in HASH_STAGES:
             self.scratch_vconst(val1)
             self.scratch_vconst(val3)
 
@@ -329,11 +331,15 @@ class KernelBuilder:
                 i_const = self.scratch_const(i)
 
                 # Load 8 indices (contiguous)
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+                body.append(
+                    ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
+                )
                 body.append(("load", ("vload", vidx, tmp_addr)))
 
                 # Load 8 values (contiguous) — use tmp_addr2 so addr calcs are independent
-                body.append(("alu", ("+", tmp_addr2, self.scratch["inp_values_p"], i_const)))
+                body.append(
+                    ("alu", ("+", tmp_addr2, self.scratch["inp_values_p"], i_const))
+                )
                 body.append(("load", ("vload", vval, tmp_addr2)))
 
                 # Gather: node_val[lane] = mem[forest_values_p + idx[lane]]
@@ -346,21 +352,30 @@ class KernelBuilder:
                 self.build_vhash(body, vval, vtmp1, vtmp2)
 
                 # idx = 2*idx + (1 if val%2==0 else 2)
-                body.append(("valu", ("&", vtmp1, vval, vone)))
-                # body.append(("flow", ("vselect", vtmp3, vtmp1, vtwo, vone)))
-                body.append(("valu", ("<<", vtmp3, vone, vtmp1)))
-                body.append(("valu", ("*", vidx, vidx, vtwo)))
-                body.append(("valu", ("+", vidx, vidx, vtmp3)))
+                body.append(("valu", ("&", vtmp1, vval, vone)))  # vtmp1 = val & 1
+                body.append(
+                    ("valu", ("multiply_add", vidx, vidx, vtwo, vone))
+                )  # vidx = 2*idx + 1
+                body.append(("valu", ("+", vidx, vidx, vtmp1)))  # vidx += (val & 1)
+                # body.append(("valu", ("&", vtmp1, vval, vone)))
+                # # body.append(("flow", ("vselect", vtmp3, vtmp1, vtwo, vone)))
+                # body.append(("valu", ("<<", vtmp3, vone, vtmp1)))  # equivalent of flow
+                # body.append(("valu", ("*", vidx, vidx, vtwo)))
+                # body.append(("valu", ("+", vidx, vidx, vtmp3)))
 
                 # idx = 0 if idx >= n_nodes else idx
                 body.append(("valu", ("<", vtmp1, vidx, vn_nodes)))
                 # body.append(("flow", ("vselect", vidx, vtmp1, vidx, vzero)))
-                body.append(("valu", ("*", vidx, vidx, vtmp1)))
+                body.append(("valu", ("*", vidx, vidx, vtmp1)))  # equivalent of flow
 
                 # Store back — use separate addr regs so they can be parallel
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+                body.append(
+                    ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
+                )
                 body.append(("store", ("vstore", tmp_addr, vidx)))
-                body.append(("alu", ("+", tmp_addr2, self.scratch["inp_values_p"], i_const)))
+                body.append(
+                    ("alu", ("+", tmp_addr2, self.scratch["inp_values_p"], i_const))
+                )
                 body.append(("store", ("vstore", tmp_addr2, vval)))
 
         self.instrs.extend(self.schedule(body))
