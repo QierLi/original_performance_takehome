@@ -168,9 +168,8 @@ class KernelBuilder:
                 self.build_vhash(vval, vtmp1, vtmp2)
 
                 # --- idx = 2*idx + (1 if val%2==0 else 2) ---
-                self.add("valu", ("%", vtmp1, vval, vtwo))
-                self.add("valu", ("==", vtmp1, vtmp1, vzero))
-                self.add("flow", ("vselect", vtmp3, vtmp1, vone, vtwo))
+                self.add("valu", ("&", vtmp1, vval, vone))  # &= instead of % -> = 
+                self.add("flow", ("vselect", vtmp3, vtmp1, vtwo, vone))
                 self.add("valu", ("*", vidx, vidx, vtwo))
                 self.add("valu", ("+", vidx, vidx, vtmp3))
 
