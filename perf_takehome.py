@@ -153,7 +153,7 @@ class KernelBuilder:
                 reads.add(slot[1])
         return reads, writes
 
-    def schedule(self, body):
+    def schedule(self, body, mem_ordering=True):
         """Schedule (engine, slot) pairs into packed VLIW bundles."""
         n = len(body)
         if n == 0:
@@ -194,14 +194,15 @@ class KernelBuilder:
                 for reader in readers_since_write.get(addr, ()):
                     deps[i].add(reader)
 
-            # Memory ordering
-            if is_mem_read and last_mem_writer >= 0:
-                deps[i].add(last_mem_writer)
-            if is_mem_write:
-                if last_mem_writer >= 0:
+            # Memory ordering (conservative — can be disabled when batches access disjoint memory)
+            if mem_ordering:
+                if is_mem_read and last_mem_writer >= 0:
                     deps[i].add(last_mem_writer)
-                for reader in mem_readers_since_write:
-                    deps[i].add(reader)
+                if is_mem_write:
+                    if last_mem_writer >= 0:
+                        deps[i].add(last_mem_writer)
+                    for reader in mem_readers_since_write:
+                        deps[i].add(reader)
 
             # Update trackers
             for addr in ops_reads[i]:
@@ -209,11 +210,12 @@ class KernelBuilder:
             for addr in ops_writes[i]:
                 last_writer[addr] = i
                 readers_since_write[addr] = set()
-            if is_mem_write:
-                last_mem_writer = i
-                mem_readers_since_write = set()
-            if is_mem_read:
-                mem_readers_since_write.add(i)
+            if mem_ordering:
+                if is_mem_write:
+                    last_mem_writer = i
+                    mem_readers_since_write = set()
+                if is_mem_read:
+                    mem_readers_since_write.add(i)
 
         # Greedy list scheduling
         dep_count = [len(d) for d in deps]
@@ -271,10 +273,10 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Vectorized kernel with automatic VLIW scheduling.
+        Vectorized kernel with software pipelining via multi-batch interleaving.
+        Multiple concurrent batches use separate register sets so the VLIW
+        scheduler can pack ops from different batches into the same bundle.
         """
-        tmp_addr = self.alloc_scratch("tmp_addr")
-        tmp_addr2 = self.alloc_scratch("tmp_addr2")
         tmp_init = self.alloc_scratch("tmp_init")
 
         # Load header from memory
@@ -294,7 +296,6 @@ class KernelBuilder:
             self.add("load", ("load", self.scratch[v], tmp_init))
 
         # Vector constants
-        vzero = self.scratch_vconst(0, "vzero")
         vone = self.scratch_vconst(1, "vone")
         vtwo = self.scratch_vconst(2, "vtwo")
 
@@ -315,70 +316,71 @@ class KernelBuilder:
 
         self.add("flow", ("pause",))
 
-        # Vector scratch registers
-        vidx = self.alloc_scratch("vidx", VLEN)
-        vval = self.alloc_scratch("vval", VLEN)
-        vnode_val = self.alloc_scratch("vnode_val", VLEN)
-        vtmp1 = self.alloc_scratch("vtmp1", VLEN)
-        vtmp2 = self.alloc_scratch("vtmp2", VLEN)
-        vtmp3 = self.alloc_scratch("vtmp3", VLEN)
-        vaddr = self.alloc_scratch("vaddr", VLEN)
+        # Allocate separate register sets for concurrent batches
+        # Merge vaddr/vtmp2 and vnode_val/vtmp1 since they have non-overlapping lifetimes
+        n_batches = batch_size // VLEN  # 32
+        N_CONCURRENT = n_batches  # All batches at once per round
 
-        # Build body as flat op list, then schedule
-        body = []
+        reg_sets = []
+        for c in range(N_CONCURRENT):
+            vtmp1 = self.alloc_scratch(f"vtmp1_{c}", VLEN)  # doubles as vnode_val
+            vtmp2 = self.alloc_scratch(f"vtmp2_{c}", VLEN)  # doubles as vaddr
+            regs = {
+                "vidx": self.alloc_scratch(f"vidx_{c}", VLEN),
+                "vval": self.alloc_scratch(f"vval_{c}", VLEN),
+                "vnode_val": vtmp1,  # aliased with vtmp1
+                "vtmp1": vtmp1,
+                "vtmp2": vtmp2,
+                "vaddr": vtmp2,  # aliased with vtmp2
+                "tmp_addr": self.alloc_scratch(f"tmp_addr_{c}"),
+                "tmp_addr2": self.alloc_scratch(f"tmp_addr2_{c}"),
+            }
+            reg_sets.append(regs)
+
         for round_idx in range(rounds):
-            for i in range(0, batch_size, VLEN):
+            body = []
+
+            for c in range(N_CONCURRENT):
+                i = c * VLEN
                 i_const = self.scratch_const(i)
+                r = reg_sets[c]
 
-                # Load 8 indices (contiguous)
-                body.append(
-                    ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
-                )
-                body.append(("load", ("vload", vidx, tmp_addr)))
+                # Load 8 indices
+                body.append(("alu", ("+", r["tmp_addr"], self.scratch["inp_indices_p"], i_const)))
+                body.append(("load", ("vload", r["vidx"], r["tmp_addr"])))
 
-                # Load 8 values (contiguous) — use tmp_addr2 so addr calcs are independent
-                body.append(
-                    ("alu", ("+", tmp_addr2, self.scratch["inp_values_p"], i_const))
-                )
-                body.append(("load", ("vload", vval, tmp_addr2)))
+                # Load 8 values
+                body.append(("alu", ("+", r["tmp_addr2"], self.scratch["inp_values_p"], i_const)))
+                body.append(("load", ("vload", r["vval"], r["tmp_addr2"])))
 
                 # Gather: node_val[lane] = mem[forest_values_p + idx[lane]]
-                body.append(("valu", ("+", vaddr, vforest_p, vidx)))
+                # vaddr is aliased with vtmp2, vnode_val is aliased with vtmp1
+                body.append(("valu", ("+", r["vaddr"], vforest_p, r["vidx"])))
                 for lane in range(VLEN):
-                    body.append(("load", ("load_offset", vnode_val, vaddr, lane)))
+                    body.append(("load", ("load_offset", r["vnode_val"], r["vaddr"], lane)))
 
                 # val = myhash(val ^ node_val)
-                body.append(("valu", ("^", vval, vval, vnode_val)))
-                self.build_vhash(body, vval, vtmp1, vtmp2)
+                body.append(("valu", ("^", r["vval"], r["vval"], r["vnode_val"])))
+                self.build_vhash(body, r["vval"], r["vtmp1"], r["vtmp2"])
 
-                # idx = 2*idx + (1 if val%2==0 else 2)
-                body.append(("valu", ("&", vtmp1, vval, vone)))  # vtmp1 = val & 1
-                body.append(
-                    ("valu", ("multiply_add", vidx, vidx, vtwo, vone))
-                )  # vidx = 2*idx + 1
-                body.append(("valu", ("+", vidx, vidx, vtmp1)))  # vidx += (val & 1)
-                # body.append(("valu", ("&", vtmp1, vval, vone)))
-                # # body.append(("flow", ("vselect", vtmp3, vtmp1, vtwo, vone)))
-                # body.append(("valu", ("<<", vtmp3, vone, vtmp1)))  # equivalent of flow
-                # body.append(("valu", ("*", vidx, vidx, vtwo)))
-                # body.append(("valu", ("+", vidx, vidx, vtmp3)))
+                # idx = 2*idx + 1 + (val & 1)
+                body.append(("valu", ("&", r["vtmp1"], r["vval"], vone)))
+                body.append(("valu", ("multiply_add", r["vidx"], r["vidx"], vtwo, vone)))
+                body.append(("valu", ("+", r["vidx"], r["vidx"], r["vtmp1"])))
 
                 # idx = 0 if idx >= n_nodes else idx
-                body.append(("valu", ("<", vtmp1, vidx, vn_nodes)))
-                # body.append(("flow", ("vselect", vidx, vtmp1, vidx, vzero)))
-                body.append(("valu", ("*", vidx, vidx, vtmp1)))  # equivalent of flow
+                body.append(("valu", ("<", r["vtmp1"], r["vidx"], vn_nodes)))
+                body.append(("valu", ("*", r["vidx"], r["vidx"], r["vtmp1"])))
 
-                # Store back — use separate addr regs so they can be parallel
-                body.append(
-                    ("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const))
-                )
-                body.append(("store", ("vstore", tmp_addr, vidx)))
-                body.append(
-                    ("alu", ("+", tmp_addr2, self.scratch["inp_values_p"], i_const))
-                )
-                body.append(("store", ("vstore", tmp_addr2, vval)))
+                # Store back
+                body.append(("alu", ("+", r["tmp_addr"], self.scratch["inp_indices_p"], i_const)))
+                body.append(("store", ("vstore", r["tmp_addr"], r["vidx"])))
+                body.append(("alu", ("+", r["tmp_addr2"], self.scratch["inp_values_p"], i_const)))
+                body.append(("store", ("vstore", r["tmp_addr2"], r["vval"])))
 
-        self.instrs.extend(self.schedule(body))
+            # Schedule all batches at once with mem_ordering=False
+            self.instrs.extend(self.schedule(body, mem_ordering=False))
+
         self.instrs.append({"flow": [("pause",)]})
 
 
